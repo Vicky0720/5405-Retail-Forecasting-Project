@@ -1,0 +1,26 @@
+{
+  "1-7": {
+    "wbaseline": 0.0,
+    "etr": 0.7,
+    "lgbm": 0.0,
+    "item_topdown": 0.3
+  },
+  "15-21": {
+    "wbaseline": 0.0,
+    "etr": 0.9,
+    "lgbm": 0.1,
+    "item_topdown": 0.0
+  },
+  "22-28": {
+    "wbaseline": 0.0,
+    "etr": 1.0,
+    "lgbm": 0.0,
+    "item_topdown": 0.0
+  },
+  "8-14": {
+    "wbaseline": 0.0,
+    "etr": 1.0,
+    "lgbm": 0.0,
+    "item_topdown": 0.0
+  }
+}
