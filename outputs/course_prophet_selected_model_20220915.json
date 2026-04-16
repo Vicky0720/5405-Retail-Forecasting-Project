@@ -1,5 +1,7 @@
 {
-  "selected_model": "item_prophet",
+  "selected_score_model": "item_prophet",
+  "selected_submission_model": "item_prophet_shape_0.30",
+  "shape_score_tolerance": 0.035,
   "selection_origins": [
     "2022-07-14",
     "2022-07-21",

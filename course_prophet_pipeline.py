@@ -36,6 +36,8 @@ ORIGINS = [
 ]
 HOLDOUT_ORIGINS = 2
 RESIDUAL_BETAS = [0.3, 0.5, 0.7, 0.9]
+SHAPE_STRENGTHS = [0.30, 0.45, 0.60]
+SHAPE_SCORE_TOLERANCE = 0.035
 
 
 def make_holidays(events: pd.DataFrame) -> pd.DataFrame | None:
@@ -255,6 +257,71 @@ def residual_correct_panel(
     return output
 
 
+def shape_correct_panel(
+    forecast_frame: pd.DataFrame,
+    history: pd.DataFrame,
+    origin: pd.Timestamp,
+    strength: float,
+) -> pd.DataFrame:
+    """Inject same-weekday residual shape while keeping the base model's level anchored."""
+    output = forecast_frame.copy()
+    output["target_date"] = pd.to_datetime(output["target_date"])
+    history_cut = history[history["date"] <= origin].copy()
+    history_cut["date"] = pd.to_datetime(history_cut["date"])
+
+    option_history = history_cut[["option_id", "date", "target"]].copy()
+    option_history["smooth"] = (
+        option_history.groupby("option_id")["target"].transform(lambda s: 0.45 * s.rolling(7, min_periods=1).mean() + 0.55 * s.rolling(28, min_periods=1).mean())
+    )
+    option_history["ratio"] = (option_history["target"] / option_history["smooth"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.35, 2.25)
+    option_ratio = option_history.set_index(["option_id", "date"])["ratio"]
+
+    total_history = history_cut.groupby("date")["target"].sum().sort_index()
+    total_smooth = 0.45 * total_history.rolling(7, min_periods=1).mean() + 0.55 * total_history.rolling(28, min_periods=1).mean()
+    total_ratio = (total_history / total_smooth.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.55, 1.75)
+
+    lag_weights = [(7, 0.45), (14, 0.30), (21, 0.15), (28, 0.10)]
+    option_factors = []
+    for row in output.itertuples():
+        ratios = []
+        weights = []
+        for lag, weight in lag_weights:
+            key = (row.option_id, row.target_date - pd.Timedelta(days=lag))
+            if key in option_ratio.index:
+                ratios.append(float(option_ratio.loc[key]))
+                weights.append(weight)
+        ratio = float(np.average(ratios, weights=weights)) if ratios else 1.0
+        horizon = max((row.target_date - origin).days, 1)
+        decay = 1.0 - 0.30 * (horizon - 1) / (DEFAULT_HORIZON - 1)
+        option_factors.append(float(np.clip(1.0 + strength * decay * (ratio - 1.0), 0.65, 1.45)))
+    output["forecast"] = output["forecast"] * np.array(option_factors)
+
+    base_total = output.groupby("target_date")["forecast"].sum().sort_index()
+    target_totals = []
+    for target_date in base_total.index:
+        ratios = []
+        weights = []
+        for lag, weight in lag_weights:
+            lag_date = target_date - pd.Timedelta(days=lag)
+            if lag_date in total_ratio.index:
+                ratios.append(float(total_ratio.loc[lag_date]))
+                weights.append(weight)
+        ratio = float(np.average(ratios, weights=weights)) if ratios else 1.0
+        horizon = max((target_date - origin).days, 1)
+        decay = 1.0 - 0.30 * (horizon - 1) / (DEFAULT_HORIZON - 1)
+        total_factor = float(np.clip(1.0 + strength * decay * (ratio - 1.0), 0.78, 1.28))
+        target_totals.append(base_total.loc[target_date] * total_factor)
+
+    target_total = pd.Series(target_totals, index=base_total.index)
+    recent_total = total_history.tail(56)
+    lower = max(0.0, float(recent_total.quantile(0.05)))
+    upper = float(recent_total.quantile(0.97) + 12.0)
+    target_total = target_total.clip(lower=lower, upper=upper)
+    scale = (target_total / base_total.replace(0, np.nan)).fillna(1.0)
+    output["forecast"] = [row.forecast * scale.loc[row.target_date] for row in output.itertuples()]
+    return output[["option_id", "target_date", "forecast"]]
+
+
 def add_horizon_columns(frame: pd.DataFrame) -> pd.DataFrame:
     output = frame.copy()
     output["horizon"] = (
@@ -457,6 +524,28 @@ def run() -> None:
     ensemble_part["model"] = "ensemble"
     long_parts.append(ensemble_part)
 
+    for base_model in ["item_prophet", "ensemble"]:
+        base_source = long_parts[model_names.index(base_model)] if base_model in model_names else ensemble_part
+        base_source = base_source[["origin", "split", "option_id", "target_date", "actual", "forecast"]].copy()
+        for strength in SHAPE_STRENGTHS:
+            corrected_parts = []
+            for origin_text, frame in base_source.groupby("origin"):
+                origin = pd.Timestamp(origin_text)
+                tmp = shape_correct_panel(
+                    frame[["option_id", "target_date", "forecast"]],
+                    history=history,
+                    origin=origin,
+                    strength=strength,
+                )
+                tmp = frame[["origin", "split", "option_id", "target_date", "actual"]].merge(
+                    tmp,
+                    on=["option_id", "target_date"],
+                    how="left",
+                )
+                tmp["model"] = f"{base_model}_shape_{strength:.2f}"
+                corrected_parts.append(tmp)
+            long_parts.append(pd.concat(corrected_parts, ignore_index=True))
+
     residual_source = ensemble_part[["origin", "split", "option_id", "target_date", "actual", "forecast"]].copy()
     for beta in RESIDUAL_BETAS:
         corrected_parts = []
@@ -522,11 +611,25 @@ def run() -> None:
 
     holdout_scores = split_summary[split_summary["split"] == "holdout"].sort_values("score", ascending=False)
     if holdout_scores.empty:
-        best_model = split_summary[split_summary["split"] == "selection"].sort_values("score", ascending=False).iloc[0]["model"]
+        best_score_model = str(split_summary[split_summary["split"] == "selection"].sort_values("score", ascending=False).iloc[0]["model"])
+        best_model = best_score_model
     else:
-        best_model = str(holdout_scores.iloc[0]["model"])
+        best_score_model = str(holdout_scores.iloc[0]["model"])
+        best_score = float(holdout_scores.iloc[0]["score"])
+        shape_scores = holdout_scores[holdout_scores["model"].str.contains("_shape_", regex=False)].copy()
+        shape_scores = shape_scores[shape_scores["score"] >= best_score - SHAPE_SCORE_TOLERANCE]
+        best_model = str(shape_scores.iloc[0]["model"]) if not shape_scores.empty else best_score_model
     (OUTPUT_DIR / f"course_prophet_selected_model_{feature_tag}.json").write_text(
-        json.dumps({"selected_model": best_model, "selection_origins": sorted(selection_origin_set), "holdout_origins": sorted(holdout_origin_set)}, indent=2),
+        json.dumps(
+            {
+                "selected_score_model": best_score_model,
+                "selected_submission_model": best_model,
+                "shape_score_tolerance": SHAPE_SCORE_TOLERANCE,
+                "selection_origins": sorted(selection_origin_set),
+                "holdout_origins": sorted(holdout_origin_set),
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
@@ -537,7 +640,16 @@ def run() -> None:
         final = tmp if final is None else final.merge(tmp, on=["option_id", "target_date"], how="inner")
     final["forecast"] = sum(weights[name] * final[f"forecast_{name}"] for name in model_names)
     final_panel = final[["option_id", "target_date", "forecast"]].sort_values(["option_id", "target_date"])
-    if best_model.startswith("ensemble_residual_beta_"):
+    if "_shape_" in best_model:
+        base_model, strength_text = best_model.rsplit("_shape_", 1)
+        strength = float(strength_text)
+        if base_model == "ensemble":
+            base_panel = final_panel
+        else:
+            source_col = f"forecast_{base_model}"
+            base_panel = final[["option_id", "target_date", source_col]].rename(columns={source_col: "forecast"})
+        final_panel = shape_correct_panel(base_panel, history=history, origin=feature_date, strength=strength)
+    elif best_model.startswith("ensemble_residual_beta_"):
         beta = float(best_model.rsplit("_", 1)[-1])
         final_panel = residual_correct_panel(final_panel, history=history, origin=feature_date, beta=beta)
     elif best_model == "ensemble_bias_global":
