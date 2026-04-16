@@ -4,7 +4,7 @@
 
 本轮已补齐前置评估项：`course_prophet_pipeline.py` 现在使用 6 个 rolling origins，其中前 4 个作为 `selection`，最后 2 个作为 `holdout`。模型权重、residual correction、bias correction 都只在 `selection` 上拟合或生成候选，然后统一进入 leaderboard，由 `holdout` 选择最终提交模型。
 
-当前 score 最优模型仍为 `item_prophet`，但最终提交采用 `item_prophet_shape_0.30`。它把 `item_prophet` 作为 level anchor，再注入最近同星期的 option-level 与 aggregate-level residual shape，并做总量校准和波动上限控制。这样用很小的 holdout 分数让步，换取更接近真实零售销量的日级峰谷。
+当前 score 最优模型仍为 `item_prophet`，但最终提交采用 `item_prophet_shape_0.30`。它把 `item_prophet` 作为 level anchor，再注入最近同星期的 option-level 与 aggregate-level residual shape，并做总量校准、软地板和远期 level reconciliation。这样用很小的 holdout 分数让步，换取更接近真实零售销量的日级峰谷，同时避免 horizon 后半段被 Prophet trend 过度下压。
 
 本轮关键输出包括：
 

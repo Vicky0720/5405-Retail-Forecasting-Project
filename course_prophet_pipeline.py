@@ -38,6 +38,8 @@ HOLDOUT_ORIGINS = 2
 RESIDUAL_BETAS = [0.3, 0.5, 0.7, 0.9]
 SHAPE_STRENGTHS = [0.30, 0.45, 0.60]
 SHAPE_SCORE_TOLERANCE = 0.035
+LEVEL_RECONCILE_START = 15
+LEVEL_RECONCILE_MAX_BLEND = 0.55
 
 
 def make_holidays(events: pd.DataFrame) -> pd.DataFrame | None:
@@ -257,6 +259,41 @@ def residual_correct_panel(
     return output
 
 
+def reconcile_far_horizon_level(
+    target_total: pd.Series,
+    total_history: pd.Series,
+    origin: pd.Timestamp,
+) -> pd.Series:
+    output = target_total.copy()
+    recent_14 = float(total_history.tail(14).mean())
+    recent_28 = float(total_history.tail(28).mean())
+    recent_anchor = 0.65 * recent_14 + 0.35 * recent_28
+    lag_weights = [(7, 0.42), (14, 0.25), (21, 0.16), (28, 0.10), (35, 0.05), (42, 0.02)]
+
+    for target_date, value in target_total.items():
+        horizon = max((target_date - origin).days, 1)
+        if horizon < LEVEL_RECONCILE_START:
+            continue
+        same_weekday_values = []
+        weights = []
+        for lag, weight in lag_weights:
+            lag_date = target_date - pd.Timedelta(days=lag)
+            if lag_date in total_history.index:
+                same_weekday_values.append(float(total_history.loc[lag_date]))
+                weights.append(weight)
+        weekday_anchor = float(np.average(same_weekday_values, weights=weights)) if same_weekday_values else recent_anchor
+        anchor = 0.75 * weekday_anchor + 0.25 * recent_anchor
+        ramp = np.clip(
+            (horizon - LEVEL_RECONCILE_START + 1) / (DEFAULT_HORIZON - LEVEL_RECONCILE_START + 1),
+            0.0,
+            1.0,
+        )
+        blend = LEVEL_RECONCILE_MAX_BLEND * ramp
+        if value < anchor:
+            output.loc[target_date] = value + blend * (anchor - value)
+    return output
+
+
 def shape_correct_panel(
     forecast_frame: pd.DataFrame,
     history: pd.DataFrame,
@@ -314,6 +351,7 @@ def shape_correct_panel(
 
     target_total = pd.Series(target_totals, index=base_total.index)
     recent_total = total_history.tail(56)
+    target_total = reconcile_far_horizon_level(target_total, total_history, origin)
     soft_lower = max(0.0, float(recent_total.quantile(0.05)))
     upper = float(recent_total.quantile(0.97) + 12.0)
     below_floor = target_total < soft_lower
