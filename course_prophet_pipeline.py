@@ -26,7 +26,16 @@ from forecast_week1 import (
 
 
 OUTPUT_DIR = Path("outputs")
-ORIGINS = [pd.Timestamp("2022-08-04"), pd.Timestamp("2022-08-11"), pd.Timestamp("2022-08-18")]
+ORIGINS = [
+    pd.Timestamp("2022-07-14"),
+    pd.Timestamp("2022-07-21"),
+    pd.Timestamp("2022-07-28"),
+    pd.Timestamp("2022-08-04"),
+    pd.Timestamp("2022-08-11"),
+    pd.Timestamp("2022-08-18"),
+]
+HOLDOUT_ORIGINS = 2
+RESIDUAL_BETAS = [0.3, 0.5, 0.7, 0.9]
 
 
 def make_holidays(events: pd.DataFrame) -> pd.DataFrame | None:
@@ -189,6 +198,110 @@ def search_weights(selection: pd.DataFrame, model_names: list[str], step: float 
     return best_weights
 
 
+def horizon_bucket(horizon: int) -> str:
+    if horizon <= 7:
+        return "1-7"
+    if horizon <= 14:
+        return "8-14"
+    if horizon <= 21:
+        return "15-21"
+    return "22-28"
+
+
+def split_origins(origins: list[pd.Timestamp]) -> tuple[set[str], set[str]]:
+    holdout = origins[-HOLDOUT_ORIGINS:] if HOLDOUT_ORIGINS > 0 else []
+    selection = origins[: len(origins) - len(holdout)]
+    return {str(x.date()) for x in selection}, {str(x.date()) for x in holdout}
+
+
+def add_ensemble_forecast(frame: pd.DataFrame, weights: dict[str, float], model_names: list[str]) -> pd.DataFrame:
+    output = frame.copy()
+    output["forecast_ensemble"] = sum(
+        weights[name] * output[f"forecast_{name}"].to_numpy(dtype=float) for name in model_names
+    )
+    return output
+
+
+def residual_correct_panel(
+    forecast_frame: pd.DataFrame,
+    history: pd.DataFrame,
+    origin: pd.Timestamp,
+    beta: float,
+) -> pd.DataFrame:
+    output = forecast_frame.copy()
+    actual_total = history[history["date"] <= origin].groupby("date")["target"].sum().sort_index()
+    base_total = output.groupby("target_date")["forecast"].sum().sort_index()
+    smooth = 0.6 * actual_total.rolling(7, min_periods=1).mean() + 0.4 * actual_total.rolling(14, min_periods=1).mean()
+    residual = actual_total - smooth
+
+    adjustments = []
+    for i, target_date in enumerate(base_total.index, start=1):
+        candidates = []
+        weights = []
+        for lag, weight in [(7, 0.45), (14, 0.30), (21, 0.15), (28, 0.10)]:
+            lag_date = target_date - pd.Timedelta(days=lag)
+            if lag_date in residual.index:
+                candidates.append(float(residual.loc[lag_date]))
+                weights.append(weight)
+        residual_adjustment = float(np.average(candidates, weights=weights)) if candidates else 0.0
+        decay = 1.0 - 0.25 * (i - 1) / max(len(base_total) - 1, 1)
+        adjustments.append(beta * decay * residual_adjustment)
+
+    lower = max(0.0, float(actual_total.tail(56).quantile(0.10)))
+    upper = float(actual_total.tail(56).quantile(0.95) + 15.0)
+    target_total = (base_total + np.array(adjustments)).clip(lower=lower, upper=upper)
+    scale = (target_total / base_total.replace(0, np.nan)).fillna(1.0)
+    output["forecast"] = [row.forecast * scale.loc[row.target_date] for row in output.itertuples()]
+    return output
+
+
+def add_horizon_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    output = frame.copy()
+    output["horizon"] = (
+        pd.to_datetime(output["target_date"]) - pd.to_datetime(output["origin"])
+    ).dt.days.astype(int)
+    output["horizon_bucket"] = output["horizon"].map(horizon_bucket)
+    return output
+
+
+def fit_bias_corrections(selection: pd.DataFrame, mapping: pd.DataFrame) -> dict[str, object]:
+    enriched = add_horizon_columns(selection).merge(mapping, on="option_id", how="left")
+    global_factor = float(enriched["actual"].sum() / enriched["forecast"].sum()) if enriched["forecast"].sum() > 0 else 1.0
+    global_factor = float(np.clip(global_factor, 0.75, 1.35))
+
+    bucket = (
+        enriched.groupby("horizon_bucket")
+        .apply(lambda g: g["actual"].sum() / g["forecast"].sum() if g["forecast"].sum() > 0 else 1.0, include_groups=False)
+        .clip(0.75, 1.35)
+        .to_dict()
+    )
+    item = (
+        enriched.groupby("item_id")
+        .apply(lambda g: g["actual"].sum() / g["forecast"].sum() if g["forecast"].sum() > 0 else 1.0, include_groups=False)
+        .clip(0.75, 1.35)
+        .to_dict()
+    )
+    return {"global": global_factor, "horizon_bucket": bucket, "item": item}
+
+
+def apply_bias_correction(frame: pd.DataFrame, mapping: pd.DataFrame, corrections: dict[str, object], mode: str) -> pd.DataFrame:
+    output = frame.copy()
+    if mode == "global":
+        output["forecast"] = output["forecast"] * float(corrections["global"])
+        return output[["option_id", "target_date", "forecast"]]
+    enriched = add_horizon_columns(output).merge(mapping, on="option_id", how="left")
+    if mode == "horizon":
+        factors = corrections["horizon_bucket"]
+        enriched["factor"] = enriched["horizon_bucket"].map(factors).fillna(1.0)
+    elif mode == "item":
+        factors = corrections["item"]
+        enriched["factor"] = enriched["item_id"].map(factors).fillna(1.0)
+    else:
+        raise ValueError(mode)
+    enriched["forecast"] = enriched["forecast"] * enriched["factor"]
+    return enriched[["option_id", "target_date", "forecast"]]
+
+
 def one_minus_ape(actual: pd.Series, forecast: pd.Series) -> pd.Series:
     actual_arr = pd.to_numeric(actual, errors="coerce").fillna(0.0).to_numpy(dtype=float)
     forecast_arr = pd.to_numeric(forecast, errors="coerce").fillna(0.0).to_numpy(dtype=float)
@@ -252,6 +365,8 @@ def save_accuracy_attribution(
 
     leaderboard = summarize_accuracy(enriched, ["model"]).sort_values("score", ascending=False)
     leaderboard.to_csv(output_dir / f"course_prophet_model_leaderboard_{feature_tag}.csv", index=False)
+    split_leaderboard = summarize_accuracy(enriched, ["split", "model"]).sort_values(["split", "score"], ascending=[True, False])
+    split_leaderboard.to_csv(output_dir / f"course_prophet_model_leaderboard_by_split_{feature_tag}.csv", index=False)
 
     for name, group_cols in {
         "day": ["model", "target_date"],
@@ -309,59 +424,110 @@ def run() -> None:
     feature_date = pd.to_datetime(panel["date"]).max()
     feature_tag = str(feature_date.date()).replace("-", "")
     model_names = ["cate2_prophet", "item_prophet", "cate2_mix", "bottomup_mix"]
+    selection_origin_set, holdout_origin_set = split_origins(ORIGINS)
 
-    backtest_rows = []
     backtest_panels = []
     for origin in ORIGINS:
         train_panel = panel[panel["date"] <= origin]
         actual = actual_for(panel, origin)
         merged = merge_candidates(actual, build_candidates(train_panel, origin, holidays))
         merged["origin"] = str(origin.date())
+        merged["split"] = "holdout" if str(origin.date()) in holdout_origin_set else "selection"
         backtest_panels.append(merged)
-        for name in model_names:
-            backtest_rows.append(
-                {
-                    "origin": str(origin.date()),
-                    "model": name,
-                    "score": weighted_1mape(merged["actual"], merged[f"forecast_{name}"]),
-                }
-            )
 
-    selection = pd.concat(backtest_panels, ignore_index=True)
+    backtest_wide = pd.concat(backtest_panels, ignore_index=True)
+    selection = backtest_wide[backtest_wide["split"] == "selection"].copy()
     weights = search_weights(selection, model_names)
-    ensemble_pred = sum(weights[name] * selection[f"forecast_{name}"].to_numpy(dtype=float) for name in model_names)
-    backtest_rows.append({"origin": "ALL", "model": "ensemble", "score": weighted_1mape(selection["actual"], ensemble_pred)})
-    for name in model_names:
-        backtest_rows.append(
-            {
-                "origin": "ALL",
-                "model": name,
-                "score": weighted_1mape(selection["actual"], selection[f"forecast_{name}"]),
-            }
-        )
+    backtest_wide = add_ensemble_forecast(backtest_wide, weights, model_names)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
-    pd.DataFrame(backtest_rows).to_csv(OUTPUT_DIR / f"course_prophet_pipeline_backtest_{feature_tag}.csv", index=False)
     (OUTPUT_DIR / f"course_prophet_pipeline_weights_{feature_tag}.json").write_text(
         json.dumps(weights, indent=2), encoding="utf-8"
     )
 
     long_parts = []
     for name in model_names:
-        part = selection[["origin", "option_id", "target_date", "actual", f"forecast_{name}"]].rename(
+        part = backtest_wide[["origin", "split", "option_id", "target_date", "actual", f"forecast_{name}"]].rename(
             columns={f"forecast_{name}": "forecast"}
         )
         part["model"] = name
         long_parts.append(part)
-    ensemble_part = selection[["origin", "option_id", "target_date", "actual"]].copy()
-    ensemble_part["forecast"] = ensemble_pred
+    ensemble_part = backtest_wide[["origin", "split", "option_id", "target_date", "actual"]].copy()
+    ensemble_part["forecast"] = backtest_wide["forecast_ensemble"]
     ensemble_part["model"] = "ensemble"
     long_parts.append(ensemble_part)
+
+    residual_source = ensemble_part[["origin", "split", "option_id", "target_date", "actual", "forecast"]].copy()
+    for beta in RESIDUAL_BETAS:
+        corrected_parts = []
+        for origin_text, frame in residual_source.groupby("origin"):
+            origin = pd.Timestamp(origin_text)
+            tmp = residual_correct_panel(
+                frame[["option_id", "target_date", "forecast"]],
+                history=history,
+                origin=origin,
+                beta=beta,
+            )
+            tmp = frame[["origin", "split", "option_id", "target_date", "actual"]].merge(
+                tmp,
+                on=["option_id", "target_date"],
+                how="left",
+            )
+            tmp["model"] = f"ensemble_residual_beta_{beta:.1f}"
+            corrected_parts.append(tmp)
+        long_parts.append(pd.concat(corrected_parts, ignore_index=True))
+
+    selection_ensemble = ensemble_part[ensemble_part["split"] == "selection"].copy()
+    corrections = fit_bias_corrections(selection_ensemble, mapping)
+    (OUTPUT_DIR / f"course_prophet_bias_corrections_{feature_tag}.json").write_text(
+        json.dumps(corrections, indent=2, default=str),
+        encoding="utf-8",
+    )
+    for mode in ["global", "horizon", "item"]:
+        corrected_parts = []
+        for _, frame in ensemble_part.groupby("origin"):
+            tmp = apply_bias_correction(
+                frame[["origin", "option_id", "target_date", "forecast"]],
+                mapping=mapping,
+                corrections=corrections,
+                mode=mode,
+            )
+            tmp = frame[["origin", "split", "option_id", "target_date", "actual"]].merge(
+                tmp,
+                on=["option_id", "target_date"],
+                how="left",
+            )
+            tmp["model"] = f"ensemble_bias_{mode}"
+            corrected_parts.append(tmp)
+        long_parts.append(pd.concat(corrected_parts, ignore_index=True))
+
+    full_long_panel = pd.concat(long_parts, ignore_index=True)
+    backtest_summary = summarize_accuracy(full_long_panel, ["origin", "split", "model"])
+    split_summary = summarize_accuracy(full_long_panel, ["split", "model"])
+    split_summary["origin"] = split_summary["split"].map({"selection": "ALL_SELECTION", "holdout": "ALL_HOLDOUT"})
+    backtest_summary = pd.concat(
+        [
+            backtest_summary,
+            split_summary[["origin", "split", "model", "score", "actual_sum", "forecast_sum", "abs_error_sum", "signed_error_sum", "bias_ratio", "n_rows"]],
+        ],
+        ignore_index=True,
+    )
+    backtest_summary.to_csv(OUTPUT_DIR / f"course_prophet_pipeline_backtest_{feature_tag}.csv", index=False)
     save_accuracy_attribution(
-        long_panel=pd.concat(long_parts, ignore_index=True),
+        long_panel=full_long_panel,
         mapping=mapping,
         output_dir=OUTPUT_DIR,
         feature_tag=feature_tag,
+    )
+
+    holdout_scores = split_summary[split_summary["split"] == "holdout"].sort_values("score", ascending=False)
+    if holdout_scores.empty:
+        best_model = split_summary[split_summary["split"] == "selection"].sort_values("score", ascending=False).iloc[0]["model"]
+    else:
+        best_model = str(holdout_scores.iloc[0]["model"])
+    (OUTPUT_DIR / f"course_prophet_selected_model_{feature_tag}.json").write_text(
+        json.dumps({"selected_model": best_model, "selection_origins": sorted(selection_origin_set), "holdout_origins": sorted(holdout_origin_set)}, indent=2),
+        encoding="utf-8",
     )
 
     candidates = build_candidates(panel, feature_date, holidays)
@@ -371,14 +537,33 @@ def run() -> None:
         final = tmp if final is None else final.merge(tmp, on=["option_id", "target_date"], how="inner")
     final["forecast"] = sum(weights[name] * final[f"forecast_{name}"] for name in model_names)
     final_panel = final[["option_id", "target_date", "forecast"]].sort_values(["option_id", "target_date"])
+    if best_model.startswith("ensemble_residual_beta_"):
+        beta = float(best_model.rsplit("_", 1)[-1])
+        final_panel = residual_correct_panel(final_panel, history=history, origin=feature_date, beta=beta)
+    elif best_model == "ensemble_bias_global":
+        final_panel = apply_bias_correction(final_panel, mapping=mapping, corrections=corrections, mode="global")
+    elif best_model == "ensemble_bias_horizon":
+        final_tmp = final_panel.copy()
+        final_tmp["origin"] = str(feature_date.date())
+        final_panel = apply_bias_correction(final_tmp, mapping=mapping, corrections=corrections, mode="horizon")
+    elif best_model == "ensemble_bias_item":
+        final_tmp = final_panel.copy()
+        final_tmp["origin"] = str(feature_date.date())
+        final_panel = apply_bias_correction(final_tmp, mapping=mapping, corrections=corrections, mode="item")
+    elif best_model != "ensemble":
+        source_col = f"forecast_{best_model}"
+        if source_col in final.columns:
+            final_panel = final[["option_id", "target_date", source_col]].rename(columns={source_col: "forecast"})
+
+    final_panel = final_panel.sort_values(["option_id", "target_date"])
     final_panel.assign(target_date=final_panel["target_date"].dt.strftime("%Y-%m-%d")).to_csv(
-        OUTPUT_DIR / f"forecast_option_day_{feature_tag}_prophet_pipeline.csv",
+        OUTPUT_DIR / f"forecast_option_day_{feature_tag}_prophet_pipeline_selected.csv",
         index=False,
     )
 
     template = load_template_from_api(api_endpoint, token, scenario_name=DEFAULT_SCENARIO)
     payload = format_submission_payload(final_panel, template=template, horizon=DEFAULT_HORIZON)
-    (OUTPUT_DIR / f"forecast_submission_{feature_tag}_prophet_pipeline.json").write_text(
+    (OUTPUT_DIR / f"forecast_submission_{feature_tag}_prophet_pipeline_selected.json").write_text(
         json.dumps(payload, indent=2),
         encoding="utf-8",
     )
@@ -390,6 +575,7 @@ def run() -> None:
     verify = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=120).json()
     print("Feature date:", feature_date.date())
     print("Weights:", json.dumps(weights))
+    print("Selected model:", best_model)
     print("Aggregate forecast:")
     print(final_panel.groupby("target_date")["forecast"].sum().round(1).to_string())
     print("Submitted rows:", len(verify))

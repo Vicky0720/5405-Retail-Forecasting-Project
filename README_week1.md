@@ -1,5 +1,19 @@
 # Week 1 Forecasting Pipeline
 
+## 2026-04-16 当前提交状态
+
+本轮已补齐前置评估项：`course_prophet_pipeline.py` 现在使用 6 个 rolling origins，其中前 4 个作为 `selection`，最后 2 个作为 `holdout`。模型权重、residual correction、bias correction 都只在 `selection` 上拟合或生成候选，然后统一进入 leaderboard，由 `holdout` 选择最终提交模型。
+
+当前自动选择结果为 `item_prophet`。这并不表示 residual/bias correction 被忽略，而是说明它们已经入榜评估，但在 holdout 上没有超过 `item_prophet`。这一步的意义是避免把 attribution 中发现的历史误差直接外推，造成看似修正、实际泛化更差的结果。
+
+本轮关键输出包括：
+
+- `outputs/course_prophet_pipeline_backtest_20220915.csv`：按 origin、split、model 汇总的 rolling backtest。
+- `outputs/course_prophet_model_leaderboard_by_split_20220915.csv`：按 `selection/holdout` 拆分的模型榜单。
+- `outputs/course_prophet_bias_corrections_20220915.json`：由 attribution 训练出的 bias correction 系数。
+- `outputs/course_prophet_selected_model_20220915.json`：holdout 自动选择出的最终模型。
+- `outputs/forecast_submission_20220915_prophet_pipeline_selected.json`：已提交到 API 的最终预测文件。
+
 当前目录中的 `forecast_week1.py` 已经升级为一个“多模型、多轮回测、分 bucket 集成”的 week 1 预测流程。
 
 最新的课程 pipeline 版本在 `course_prophet_pipeline.py` 中：它按 Session7 思路组合 `cate2/item` top-down、Prophet、bottom-up mix 和 weighted `1-MAPE` 权重搜索，用来生成更少机械重复感的提交结果。
