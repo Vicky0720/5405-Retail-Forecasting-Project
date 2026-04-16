@@ -189,6 +189,102 @@ def search_weights(selection: pd.DataFrame, model_names: list[str], step: float 
     return best_weights
 
 
+def one_minus_ape(actual: pd.Series, forecast: pd.Series) -> pd.Series:
+    actual_arr = pd.to_numeric(actual, errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    forecast_arr = pd.to_numeric(forecast, errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    score = np.zeros_like(actual_arr, dtype=float)
+    positive = actual_arr > 0
+    score[positive] = 1.0 - np.abs(actual_arr[positive] - forecast_arr[positive]) / actual_arr[positive]
+    return pd.Series(score, index=actual.index)
+
+
+def summarize_accuracy(frame: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    def _metrics(group: pd.DataFrame) -> pd.Series:
+        actual = group["actual"].astype(float)
+        forecast = group["forecast"].astype(float)
+        abs_error = (actual - forecast).abs()
+        signed_error = forecast - actual
+        weight = actual.clip(lower=0.0)
+        weighted_error = abs_error.sum()
+        actual_sum = weight.sum()
+        weighted_score = weighted_1mape(actual, forecast)
+        return pd.Series(
+            {
+                "score": weighted_score,
+                "actual_sum": float(actual_sum),
+                "forecast_sum": float(forecast.sum()),
+                "abs_error_sum": float(weighted_error),
+                "signed_error_sum": float(signed_error.sum()),
+                "bias_ratio": float(signed_error.sum() / actual_sum) if actual_sum > 0 else 0.0,
+                "n_rows": len(group),
+            }
+        )
+
+    if not group_cols:
+        return pd.DataFrame([_metrics(frame)])
+    return (
+        frame.groupby(group_cols, as_index=False)
+        .apply(lambda g: _metrics(g), include_groups=False)
+        .reset_index(drop=True)
+    )
+
+
+def add_accuracy_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    output = frame.copy()
+    output["horizon"] = (
+        pd.to_datetime(output["target_date"]) - pd.to_datetime(output["origin"])
+    ).dt.days.astype(int)
+    output["abs_error"] = (output["actual"] - output["forecast"]).abs()
+    output["signed_error"] = output["forecast"] - output["actual"]
+    output["one_minus_ape"] = one_minus_ape(output["actual"], output["forecast"])
+    return output
+
+
+def save_accuracy_attribution(
+    long_panel: pd.DataFrame,
+    mapping: pd.DataFrame,
+    output_dir: Path,
+    feature_tag: str,
+) -> None:
+    enriched = long_panel.merge(mapping, on="option_id", how="left")
+    enriched = add_accuracy_columns(enriched)
+    enriched.to_csv(output_dir / f"course_prophet_backtest_predictions_long_{feature_tag}.csv", index=False)
+
+    leaderboard = summarize_accuracy(enriched, ["model"]).sort_values("score", ascending=False)
+    leaderboard.to_csv(output_dir / f"course_prophet_model_leaderboard_{feature_tag}.csv", index=False)
+
+    for name, group_cols in {
+        "day": ["model", "target_date"],
+        "horizon": ["model", "horizon"],
+        "option": ["model", "option_id"],
+        "item": ["model", "item_id"],
+        "cate2": ["model", "cate2_id"],
+    }.items():
+        summary = summarize_accuracy(enriched, group_cols)
+        summary.to_csv(output_dir / f"course_prophet_accuracy_by_{name}_{feature_tag}.csv", index=False)
+
+    ensemble = enriched[enriched["model"] == "ensemble"].copy()
+    contribution_rows = []
+    total_abs_error = ensemble["abs_error"].sum()
+    for name, group_col in [("day", "target_date"), ("option", "option_id"), ("item", "item_id"), ("cate2", "cate2_id")]:
+        grouped = ensemble.groupby(group_col, as_index=False).agg(
+            actual_sum=("actual", "sum"),
+            forecast_sum=("forecast", "sum"),
+            abs_error_sum=("abs_error", "sum"),
+            signed_error_sum=("signed_error", "sum"),
+        )
+        grouped["contribution_share"] = (
+            grouped["abs_error_sum"] / total_abs_error if total_abs_error > 0 else 0.0
+        )
+        grouped["attribution_level"] = name
+        grouped = grouped.rename(columns={group_col: "key"})
+        contribution_rows.append(grouped)
+    pd.concat(contribution_rows, ignore_index=True).to_csv(
+        output_dir / f"course_prophet_error_contribution_{feature_tag}.csv",
+        index=False,
+    )
+
+
 def run() -> None:
     token = os.getenv("RETAIL_ANALYTICS_ACCESS_TOKEN")
     if not token:
@@ -248,6 +344,24 @@ def run() -> None:
     pd.DataFrame(backtest_rows).to_csv(OUTPUT_DIR / f"course_prophet_pipeline_backtest_{feature_tag}.csv", index=False)
     (OUTPUT_DIR / f"course_prophet_pipeline_weights_{feature_tag}.json").write_text(
         json.dumps(weights, indent=2), encoding="utf-8"
+    )
+
+    long_parts = []
+    for name in model_names:
+        part = selection[["origin", "option_id", "target_date", "actual", f"forecast_{name}"]].rename(
+            columns={f"forecast_{name}": "forecast"}
+        )
+        part["model"] = name
+        long_parts.append(part)
+    ensemble_part = selection[["origin", "option_id", "target_date", "actual"]].copy()
+    ensemble_part["forecast"] = ensemble_pred
+    ensemble_part["model"] = "ensemble"
+    long_parts.append(ensemble_part)
+    save_accuracy_attribution(
+        long_panel=pd.concat(long_parts, ignore_index=True),
+        mapping=mapping,
+        output_dir=OUTPUT_DIR,
+        feature_tag=feature_tag,
     )
 
     candidates = build_candidates(panel, feature_date, holidays)
