@@ -2,6 +2,8 @@
 
 当前目录中的 `forecast_week1.py` 已经升级为一个“多模型、多轮回测、分 bucket 集成”的 week 1 预测流程。
 
+最新的课程 pipeline 版本在 `course_prophet_pipeline.py` 中：它按 Session7 思路组合 `cate2/item` top-down、Prophet、bottom-up mix 和 weighted `1-MAPE` 权重搜索，用来生成更少机械重复感的提交结果。
+
 如果你更喜欢交互式使用，也可以直接打开：
 
 - `forecast_week1_workflow.ipynb`
