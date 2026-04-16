@@ -4,6 +4,8 @@
 
 最新的课程 pipeline 版本在 `course_prophet_pipeline.py` 中：它按 Session7 思路组合 `cate2/item` top-down、Prophet、bottom-up mix 和 weighted `1-MAPE` 权重搜索，用来生成更少机械重复感的提交结果。
 
+当前线上提交采用 Prophet pipeline 后的 residual-corrected 版本：在保持 Prophet 非重复趋势/季节结构的基础上，加入近期 aggregate residual pattern，以减少过度平滑。
+
 如果你更喜欢交互式使用，也可以直接打开：
 
 - `forecast_week1_workflow.ipynb`
