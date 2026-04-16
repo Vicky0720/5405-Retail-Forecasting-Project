@@ -39,7 +39,12 @@ RESIDUAL_BETAS = [0.3, 0.5, 0.7, 0.9]
 SHAPE_STRENGTHS = [0.30, 0.45, 0.60]
 SHAPE_SCORE_TOLERANCE = 0.035
 LEVEL_RECONCILE_START = 15
-LEVEL_RECONCILE_MAX_BLEND = 0.55
+LEVEL_RECONCILE_PROFILES = {
+    "off": {"1-7": 0.0, "8-14": 0.0, "15-21": 0.0, "22-28": 0.0},
+    "light": {"1-7": 0.0, "8-14": 0.0, "15-21": 0.18, "22-28": 0.32},
+    "medium": {"1-7": 0.0, "8-14": 0.0, "15-21": 0.32, "22-28": 0.55},
+    "strong": {"1-7": 0.0, "8-14": 0.08, "15-21": 0.46, "22-28": 0.72},
+}
 
 
 def make_holidays(events: pd.DataFrame) -> pd.DataFrame | None:
@@ -263,6 +268,7 @@ def reconcile_far_horizon_level(
     target_total: pd.Series,
     total_history: pd.Series,
     origin: pd.Timestamp,
+    blend_profile: dict[str, float],
 ) -> pd.Series:
     output = target_total.copy()
     recent_14 = float(total_history.tail(14).mean())
@@ -273,6 +279,9 @@ def reconcile_far_horizon_level(
     for target_date, value in target_total.items():
         horizon = max((target_date - origin).days, 1)
         if horizon < LEVEL_RECONCILE_START:
+            continue
+        max_blend = float(blend_profile.get(horizon_bucket(horizon), 0.0))
+        if max_blend <= 0:
             continue
         same_weekday_values = []
         weights = []
@@ -288,10 +297,45 @@ def reconcile_far_horizon_level(
             0.0,
             1.0,
         )
-        blend = LEVEL_RECONCILE_MAX_BLEND * ramp
+        blend = max_blend * ramp
         if value < anchor:
             output.loc[target_date] = value + blend * (anchor - value)
     return output
+
+
+def reconcile_group_levels(
+    forecast_frame: pd.DataFrame,
+    history_cut: pd.DataFrame,
+    origin: pd.Timestamp,
+    group_col: str,
+    blend_profile: dict[str, float],
+) -> pd.DataFrame:
+    if group_col not in history_cut.columns:
+        return forecast_frame
+
+    option_groups = history_cut[["option_id", group_col]].dropna().drop_duplicates("option_id")
+    if option_groups.empty:
+        return forecast_frame
+
+    enriched = forecast_frame.merge(option_groups, on="option_id", how="left")
+    history_grouped = history_cut.dropna(subset=[group_col]).groupby([group_col, "date"])["target"].sum()
+    for group_id, group in enriched.dropna(subset=[group_col]).groupby(group_col):
+        if group_id not in history_grouped.index.get_level_values(0):
+            continue
+        base_total = group.groupby("target_date")["forecast"].sum().sort_index()
+        group_history = history_grouped.loc[group_id].sort_index()
+        if len(group_history) < 28 or group_history.tail(28).sum() <= 0:
+            continue
+        target_total = reconcile_far_horizon_level(base_total, group_history, origin, blend_profile)
+        recent_group = group_history.tail(56)
+        upper = float(recent_group.quantile(0.98) + max(2.0, recent_group.mean() * 0.10))
+        target_total = target_total.clip(lower=0.0, upper=upper)
+        scale = (target_total / base_total.replace(0, np.nan)).fillna(1.0)
+        idx = enriched[group_col] == group_id
+        enriched.loc[idx, "forecast"] = [
+            row.forecast * scale.loc[row.target_date] for row in enriched.loc[idx].itertuples()
+        ]
+    return enriched[["option_id", "target_date", "forecast"]]
 
 
 def shape_correct_panel(
@@ -299,12 +343,14 @@ def shape_correct_panel(
     history: pd.DataFrame,
     origin: pd.Timestamp,
     strength: float,
+    level_profile: str = "medium",
 ) -> pd.DataFrame:
     """Inject same-weekday residual shape while keeping the base model's level anchored."""
     output = forecast_frame.copy()
     output["target_date"] = pd.to_datetime(output["target_date"])
     history_cut = history[history["date"] <= origin].copy()
     history_cut["date"] = pd.to_datetime(history_cut["date"])
+    blend_profile = LEVEL_RECONCILE_PROFILES[level_profile]
 
     option_history = history_cut[["option_id", "date", "target"]].copy()
     option_history["smooth"] = (
@@ -332,6 +378,8 @@ def shape_correct_panel(
         decay = 1.0 - 0.30 * (horizon - 1) / (DEFAULT_HORIZON - 1)
         option_factors.append(float(np.clip(1.0 + strength * decay * (ratio - 1.0), 0.65, 1.45)))
     output["forecast"] = output["forecast"] * np.array(option_factors)
+    output = reconcile_group_levels(output, history_cut, origin, "cate2_id", blend_profile)
+    output = reconcile_group_levels(output, history_cut, origin, "item_id", blend_profile)
 
     base_total = output.groupby("target_date")["forecast"].sum().sort_index()
     target_totals = []
@@ -351,7 +399,7 @@ def shape_correct_panel(
 
     target_total = pd.Series(target_totals, index=base_total.index)
     recent_total = total_history.tail(56)
-    target_total = reconcile_far_horizon_level(target_total, total_history, origin)
+    target_total = reconcile_far_horizon_level(target_total, total_history, origin, blend_profile)
     soft_lower = max(0.0, float(recent_total.quantile(0.05)))
     upper = float(recent_total.quantile(0.97) + 12.0)
     below_floor = target_total < soft_lower
@@ -568,23 +616,25 @@ def run() -> None:
         base_source = long_parts[model_names.index(base_model)] if base_model in model_names else ensemble_part
         base_source = base_source[["origin", "split", "option_id", "target_date", "actual", "forecast"]].copy()
         for strength in SHAPE_STRENGTHS:
-            corrected_parts = []
-            for origin_text, frame in base_source.groupby("origin"):
-                origin = pd.Timestamp(origin_text)
-                tmp = shape_correct_panel(
-                    frame[["option_id", "target_date", "forecast"]],
-                    history=history,
-                    origin=origin,
-                    strength=strength,
-                )
-                tmp = frame[["origin", "split", "option_id", "target_date", "actual"]].merge(
-                    tmp,
-                    on=["option_id", "target_date"],
-                    how="left",
-                )
-                tmp["model"] = f"{base_model}_shape_{strength:.2f}"
-                corrected_parts.append(tmp)
-            long_parts.append(pd.concat(corrected_parts, ignore_index=True))
+            for level_profile in LEVEL_RECONCILE_PROFILES:
+                corrected_parts = []
+                for origin_text, frame in base_source.groupby("origin"):
+                    origin = pd.Timestamp(origin_text)
+                    tmp = shape_correct_panel(
+                        frame[["option_id", "target_date", "forecast"]],
+                        history=panel,
+                        origin=origin,
+                        strength=strength,
+                        level_profile=level_profile,
+                    )
+                    tmp = frame[["origin", "split", "option_id", "target_date", "actual"]].merge(
+                        tmp,
+                        on=["option_id", "target_date"],
+                        how="left",
+                    )
+                    tmp["model"] = f"{base_model}_shape_{strength:.2f}_level_{level_profile}"
+                    corrected_parts.append(tmp)
+                long_parts.append(pd.concat(corrected_parts, ignore_index=True))
 
     residual_source = ensemble_part[["origin", "split", "option_id", "target_date", "actual", "forecast"]].copy()
     for beta in RESIDUAL_BETAS:
@@ -658,12 +708,17 @@ def run() -> None:
         best_score = float(holdout_scores.iloc[0]["score"])
         shape_scores = holdout_scores[holdout_scores["model"].str.contains("_shape_", regex=False)].copy()
         shape_scores = shape_scores[shape_scores["score"] >= best_score - SHAPE_SCORE_TOLERANCE]
-        best_model = str(shape_scores.iloc[0]["model"]) if not shape_scores.empty else best_score_model
+        reconciled_shape_scores = shape_scores[~shape_scores["model"].str.endswith("_level_off")]
+        if not reconciled_shape_scores.empty:
+            best_model = str(reconciled_shape_scores.iloc[0]["model"])
+        else:
+            best_model = str(shape_scores.iloc[0]["model"]) if not shape_scores.empty else best_score_model
     (OUTPUT_DIR / f"course_prophet_selected_model_{feature_tag}.json").write_text(
         json.dumps(
             {
                 "selected_score_model": best_score_model,
                 "selected_submission_model": best_model,
+                "selection_policy": "Prefer the best non-off hierarchical level reconciliation within the holdout score tolerance.",
                 "shape_score_tolerance": SHAPE_SCORE_TOLERANCE,
                 "selection_origins": sorted(selection_origin_set),
                 "holdout_origins": sorted(holdout_origin_set),
@@ -681,14 +736,21 @@ def run() -> None:
     final["forecast"] = sum(weights[name] * final[f"forecast_{name}"] for name in model_names)
     final_panel = final[["option_id", "target_date", "forecast"]].sort_values(["option_id", "target_date"])
     if "_shape_" in best_model:
-        base_model, strength_text = best_model.rsplit("_shape_", 1)
+        shape_name, level_profile = best_model.rsplit("_level_", 1)
+        base_model, strength_text = shape_name.rsplit("_shape_", 1)
         strength = float(strength_text)
         if base_model == "ensemble":
             base_panel = final_panel
         else:
             source_col = f"forecast_{base_model}"
             base_panel = final[["option_id", "target_date", source_col]].rename(columns={source_col: "forecast"})
-        final_panel = shape_correct_panel(base_panel, history=history, origin=feature_date, strength=strength)
+        final_panel = shape_correct_panel(
+            base_panel,
+            history=panel,
+            origin=feature_date,
+            strength=strength,
+            level_profile=level_profile,
+        )
     elif best_model.startswith("ensemble_residual_beta_"):
         beta = float(best_model.rsplit("_", 1)[-1])
         final_panel = residual_correct_panel(final_panel, history=history, origin=feature_date, beta=beta)
