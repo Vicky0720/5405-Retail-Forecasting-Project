@@ -314,9 +314,11 @@ def shape_correct_panel(
 
     target_total = pd.Series(target_totals, index=base_total.index)
     recent_total = total_history.tail(56)
-    lower = max(0.0, float(recent_total.quantile(0.05)))
+    soft_lower = max(0.0, float(recent_total.quantile(0.05)))
     upper = float(recent_total.quantile(0.97) + 12.0)
-    target_total = target_total.clip(lower=lower, upper=upper)
+    below_floor = target_total < soft_lower
+    target_total.loc[below_floor] = soft_lower - 0.45 * (soft_lower - target_total.loc[below_floor])
+    target_total = target_total.clip(lower=0.0, upper=upper)
     scale = (target_total / base_total.replace(0, np.nan)).fillna(1.0)
     output["forecast"] = [row.forecast * scale.loc[row.target_date] for row in output.itertuples()]
     return output[["option_id", "target_date", "forecast"]]
