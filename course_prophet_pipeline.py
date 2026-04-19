@@ -45,6 +45,10 @@ LEVEL_RECONCILE_PROFILES = {
     "medium": {"1-7": 0.0, "8-14": 0.0, "15-21": 0.32, "22-28": 0.55},
     "strong": {"1-7": 0.0, "8-14": 0.08, "15-21": 0.46, "22-28": 0.72},
 }
+HYBRID_RESIDUAL_BETAS = [0.5, 0.7, 0.9]
+HYBRID_SHAPE_STRENGTH = 0.30
+HYBRID_LEVEL_PROFILE = "light"
+HYBRID_SCORE_TOLERANCE = 0.045
 
 
 def make_holidays(events: pd.DataFrame) -> pd.DataFrame | None:
@@ -221,6 +225,11 @@ def split_origins(origins: list[pd.Timestamp]) -> tuple[set[str], set[str]]:
     holdout = origins[-HOLDOUT_ORIGINS:] if HOLDOUT_ORIGINS > 0 else []
     selection = origins[: len(origins) - len(holdout)]
     return {str(x.date()) for x in selection}, {str(x.date()) for x in holdout}
+
+
+def rolling_origins_for_feature(feature_date: pd.Timestamp, count: int = 6) -> list[pd.Timestamp]:
+    latest_origin = feature_date - pd.Timedelta(days=DEFAULT_HORIZON)
+    return [latest_origin - pd.Timedelta(days=7 * i) for i in range(count - 1, -1, -1)]
 
 
 def add_ensemble_forecast(frame: pd.DataFrame, weights: dict[str, float], model_names: list[str]) -> pd.DataFrame:
@@ -410,6 +419,36 @@ def shape_correct_panel(
     return output[["option_id", "target_date", "forecast"]]
 
 
+def horizon_hybrid_panel(
+    residual_frame: pd.DataFrame,
+    item_frame: pd.DataFrame,
+    shape_frame: pd.DataFrame,
+    origin: pd.Timestamp,
+) -> pd.DataFrame:
+    merged = residual_frame.rename(columns={"forecast": "forecast_residual"}).merge(
+        item_frame.rename(columns={"forecast": "forecast_item"}),
+        on=["option_id", "target_date"],
+        how="inner",
+    ).merge(
+        shape_frame.rename(columns={"forecast": "forecast_shape"}),
+        on=["option_id", "target_date"],
+        how="inner",
+    )
+    horizon = (pd.to_datetime(merged["target_date"]) - origin).dt.days
+    merged["forecast"] = np.select(
+        [
+            horizon <= 7,
+            horizon <= 14,
+        ],
+        [
+            merged["forecast_residual"],
+            0.65 * merged["forecast_residual"] + 0.35 * merged["forecast_item"],
+        ],
+        default=merged["forecast_shape"],
+    )
+    return merged[["option_id", "target_date", "forecast"]]
+
+
 def add_horizon_columns(frame: pd.DataFrame) -> pd.DataFrame:
     output = frame.copy()
     output["horizon"] = (
@@ -579,10 +618,11 @@ def run() -> None:
     feature_date = pd.to_datetime(panel["date"]).max()
     feature_tag = str(feature_date.date()).replace("-", "")
     model_names = ["cate2_prophet", "item_prophet", "cate2_mix", "bottomup_mix"]
-    selection_origin_set, holdout_origin_set = split_origins(ORIGINS)
+    origins = rolling_origins_for_feature(feature_date)
+    selection_origin_set, holdout_origin_set = split_origins(origins)
 
     backtest_panels = []
-    for origin in ORIGINS:
+    for origin in origins:
         train_panel = panel[panel["date"] <= origin]
         actual = actual_for(panel, origin)
         merged = merge_candidates(actual, build_candidates(train_panel, origin, holidays))
@@ -637,6 +677,7 @@ def run() -> None:
                 long_parts.append(pd.concat(corrected_parts, ignore_index=True))
 
     residual_source = ensemble_part[["origin", "split", "option_id", "target_date", "actual", "forecast"]].copy()
+    hybrid_parts_by_beta = {beta: [] for beta in HYBRID_RESIDUAL_BETAS}
     for beta in RESIDUAL_BETAS:
         corrected_parts = []
         for origin_text, frame in residual_source.groupby("origin"):
@@ -654,7 +695,34 @@ def run() -> None:
             )
             tmp["model"] = f"ensemble_residual_beta_{beta:.1f}"
             corrected_parts.append(tmp)
+            if beta in hybrid_parts_by_beta:
+                item_frame = backtest_wide[backtest_wide["origin"] == origin_text][
+                    ["option_id", "target_date", "forecast_item_prophet"]
+                ].rename(columns={"forecast_item_prophet": "forecast"})
+                shape_frame = shape_correct_panel(
+                    item_frame,
+                    history=panel,
+                    origin=origin,
+                    strength=HYBRID_SHAPE_STRENGTH,
+                    level_profile=HYBRID_LEVEL_PROFILE,
+                )
+                hybrid = horizon_hybrid_panel(
+                    residual_frame=tmp[["option_id", "target_date", "forecast"]],
+                    item_frame=item_frame,
+                    shape_frame=shape_frame,
+                    origin=origin,
+                )
+                hybrid = frame[["origin", "split", "option_id", "target_date", "actual"]].merge(
+                    hybrid,
+                    on=["option_id", "target_date"],
+                    how="left",
+                )
+                hybrid["model"] = f"hybrid_short_residual_beta_{beta:.1f}"
+                hybrid_parts_by_beta[beta].append(hybrid)
         long_parts.append(pd.concat(corrected_parts, ignore_index=True))
+    for beta, parts in hybrid_parts_by_beta.items():
+        if parts:
+            long_parts.append(pd.concat(parts, ignore_index=True))
 
     selection_ensemble = ensemble_part[ensemble_part["split"] == "selection"].copy()
     corrections = fit_bias_corrections(selection_ensemble, mapping)
@@ -706,10 +774,14 @@ def run() -> None:
     else:
         best_score_model = str(holdout_scores.iloc[0]["model"])
         best_score = float(holdout_scores.iloc[0]["score"])
+        hybrid_scores = holdout_scores[holdout_scores["model"].str.startswith("hybrid_short_residual_beta_")].copy()
+        hybrid_scores = hybrid_scores[hybrid_scores["score"] >= best_score - HYBRID_SCORE_TOLERANCE]
         shape_scores = holdout_scores[holdout_scores["model"].str.contains("_shape_", regex=False)].copy()
         shape_scores = shape_scores[shape_scores["score"] >= best_score - SHAPE_SCORE_TOLERANCE]
         reconciled_shape_scores = shape_scores[~shape_scores["model"].str.endswith("_level_off")]
-        if not reconciled_shape_scores.empty:
+        if not hybrid_scores.empty:
+            best_model = str(hybrid_scores.iloc[0]["model"])
+        elif not reconciled_shape_scores.empty:
             best_model = str(reconciled_shape_scores.iloc[0]["model"])
         else:
             best_model = str(shape_scores.iloc[0]["model"]) if not shape_scores.empty else best_score_model
@@ -718,7 +790,8 @@ def run() -> None:
             {
                 "selected_score_model": best_score_model,
                 "selected_submission_model": best_model,
-                "selection_policy": "Prefer the best non-off hierarchical level reconciliation within the holdout score tolerance.",
+                "selection_policy": "Prefer short-horizon residual hybrids within tolerance; otherwise prefer the best non-off hierarchical level reconciliation within tolerance.",
+                "hybrid_score_tolerance": HYBRID_SCORE_TOLERANCE,
                 "shape_score_tolerance": SHAPE_SCORE_TOLERANCE,
                 "selection_origins": sorted(selection_origin_set),
                 "holdout_origins": sorted(holdout_origin_set),
@@ -735,7 +808,26 @@ def run() -> None:
         final = tmp if final is None else final.merge(tmp, on=["option_id", "target_date"], how="inner")
     final["forecast"] = sum(weights[name] * final[f"forecast_{name}"] for name in model_names)
     final_panel = final[["option_id", "target_date", "forecast"]].sort_values(["option_id", "target_date"])
-    if "_shape_" in best_model:
+    if best_model.startswith("hybrid_short_residual_beta_"):
+        beta = float(best_model.rsplit("_", 1)[-1])
+        residual_panel = residual_correct_panel(final_panel, history=history, origin=feature_date, beta=beta)
+        item_panel = final[["option_id", "target_date", "forecast_item_prophet"]].rename(
+            columns={"forecast_item_prophet": "forecast"}
+        )
+        shape_panel = shape_correct_panel(
+            item_panel,
+            history=panel,
+            origin=feature_date,
+            strength=HYBRID_SHAPE_STRENGTH,
+            level_profile=HYBRID_LEVEL_PROFILE,
+        )
+        final_panel = horizon_hybrid_panel(
+            residual_frame=residual_panel[["option_id", "target_date", "forecast"]],
+            item_frame=item_panel,
+            shape_frame=shape_panel,
+            origin=feature_date,
+        )
+    elif "_shape_" in best_model:
         shape_name, level_profile = best_model.rsplit("_level_", 1)
         base_model, strength_text = shape_name.rsplit("_shape_", 1)
         strength = float(strength_text)

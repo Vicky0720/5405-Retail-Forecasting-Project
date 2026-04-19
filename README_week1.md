@@ -4,7 +4,7 @@
 
 本轮已补齐前置评估项：`course_prophet_pipeline.py` 现在使用 6 个 rolling origins，其中前 4 个作为 `selection`，最后 2 个作为 `holdout`。模型权重、residual correction、bias correction 都只在 `selection` 上拟合或生成候选，然后统一进入 leaderboard，由 `holdout` 选择最终提交模型。
 
-当前 score 最优模型仍为 `item_prophet`，但最终提交采用 `item_prophet_shape_0.30_level_light`。它把 `item_prophet` 作为 level anchor，再注入最近同星期的 option-level 与 aggregate-level residual shape，并在 `cate2 -> item -> total` 层级上搜索 `off/light/medium/strong` 四档远期 level reconciliation。最终选择规则是在 holdout 容忍范围内优先采用最高分的非 `off` 层级校准版本，用很小的 holdout 分数让步换取更合理的远期 level 和类目结构。
+最新一轮已根据 `2022-09-16` 到 `2022-09-22` 的揭晓结果调整策略。前一版 `item_prophet_shape_0.30_level_light` 在已揭晓 7 天上系统性低估，短期表现不如 `prophet_residual`，因此当前提交改为 `hybrid_short_residual_beta_0.5`：horizon 1-7 使用 aggregate residual correction，horizon 8-14 使用 residual 与 item Prophet 混合，horizon 15-28 才使用 light 层级 shape reconciliation。同时 rolling origins 会随最新 feature date 动态后移，当前 holdout 使用更靠近新阶段的 `2022-08-18` 和 `2022-08-25`。
 
 本轮关键输出包括：
 

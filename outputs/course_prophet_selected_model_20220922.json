@@ -1,0 +1,17 @@
+{
+  "selected_score_model": "cate2_prophet",
+  "selected_submission_model": "hybrid_short_residual_beta_0.5",
+  "selection_policy": "Prefer short-horizon residual hybrids within tolerance; otherwise prefer the best non-off hierarchical level reconciliation within tolerance.",
+  "hybrid_score_tolerance": 0.045,
+  "shape_score_tolerance": 0.035,
+  "selection_origins": [
+    "2022-07-21",
+    "2022-07-28",
+    "2022-08-04",
+    "2022-08-11"
+  ],
+  "holdout_origins": [
+    "2022-08-18",
+    "2022-08-25"
+  ]
+}
